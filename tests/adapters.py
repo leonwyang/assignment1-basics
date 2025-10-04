@@ -1,8 +1,167 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from typing import IO, Any, BinaryIO
+import re
+from collections import Counter
+from typing import Any, Iterable, Iterator, List, Tuple, Dict, Optional
+
+
+class BPETokenizer:
+    def __init__(
+        self,
+        id_to_bytes: Dict[int, bytes],
+        merges: List[Tuple[bytes, bytes]],
+        special_tokens: Optional[List[str]] = None,
+    ):
+        # Core maps
+        self.id_to_bytes: Dict[int, bytes] = dict(id_to_bytes)
+        self.bytes_to_id: Dict[bytes, int] = {b: i for i, b in self.id_to_bytes.items()}
+
+        # Merge ranks: lower index = higher priority
+        self.ranks: Dict[Tuple[bytes, bytes], int] = {
+            pair: rank for rank, pair in enumerate(merges)
+        }
+
+        # Special tokens
+        self.special_tokens: List[str] = special_tokens or []
+        if self.special_tokens:
+            escaped = [re.escape(s) for s in sorted(self.special_tokens, key=len, reverse=True)]
+            self._special_re = re.compile("(" + "|".join(escaped) + ")")
+        else:
+            self._special_re = None
+
+        # Require byte-level base (gpt2/tiktoken style)
+        missing = [bytes([b]) for b in range(256) if bytes([b]) not in self.bytes_to_id]
+        if missing:
+            raise ValueError(
+                f"Vocabulary is missing {len(missing)} single-byte entries (byte-level base required)."
+            )
+
+        # Ensure specials exist as UTF-8 bytes in vocab
+        for tok in self.special_tokens:
+            b = tok.encode("utf-8")
+            if b not in self.bytes_to_id:
+                raise ValueError(f"Special token {tok!r} not found in vocab.")
+
+        # Cache the single '\n' id (used for newline isolation)
+        self._nl_id = self.bytes_to_id[b"\n"]
+
+    # ---------- Public API ----------
+    def encode(self, text: str) -> List[int]:
+        if not text:
+            return []
+        return list(self._encode_iter(text))
+
+    def encode_iterable(self, source: Iterable[str]) -> Iterator[int]:
+        """Yield token IDs lazily from an iterable of strings (e.g., an open file)."""
+        for chunk in source:
+            yield from self._encode_iter(chunk)
+
+    def decode(self, ids: Iterable[int]) -> str:
+        b = b"".join(self.id_to_bytes[i] for i in ids)
+        return b.decode("utf-8", errors="replace")
+
+    # ---------- Internals ----------
+    def _encode_iter(self, text: str) -> Iterator[int]:
+        """Handle specials and newline isolation; run BPE on non-newline spans."""
+        if not text:
+            return
+        if self._special_re is None:
+            # No specials: encode entire text
+            yield from self._encode_without_specials(text)
+            return
+
+        # Split into [segment, special, segment, ...]
+        parts = self._special_re.split(text)
+        for part in parts:
+            if not part:
+                continue
+            if part in self.special_tokens:
+                # Emit the special token id
+                yield self.bytes_to_id[part.encode("utf-8")]
+            else:
+                yield from self._encode_without_specials(part)
+
+    def _encode_without_specials(self, segment: str) -> Iterator[int]:
+        if not segment:
+            return
+        data = segment.encode("utf-8")
+        i = 0
+        n = len(data)
+        while i < n:
+            try:
+                j = data.index(b"\n", i)
+            except ValueError:
+                # no more newlines: BPE the tail
+                if i < n:
+                    yield from self._bpe_bytes(data[i:n])
+                break
+
+            # bytes before the newline
+            if j > i:
+                yield from self._bpe_bytes(data[i:j])
+
+            # find the end of this run of consecutive newlines
+            k = j
+            while k < n and data[k] == 0x0A:  # b"\n"
+                k += 1
+
+            if k == n:
+                # TRAILING newline run: allow BPE merges (e.g., "\n\n" -> 628)
+                yield from self._bpe_bytes(data[j:k])
+                break
+            else:
+                # MIDDLE newline run: emit one '\n' token per newline (no merging)
+                count = k - j
+                for _ in range(count):
+                    yield self._nl_id
+                i = k
+
+    def _bpe_bytes(self, data: bytes) -> Iterator[int]:
+        """Standard BPE on the provided bytes (no crossing newline boundaries)."""
+        if not data:
+            return
+        tokens: List[bytes] = [bytes([b]) for b in data]
+
+        while True:
+            best_rank = None
+            best_pair = None
+            i = 0
+            # Find best-ranked adjacent pair
+            while i < len(tokens) - 1:
+                pair = (tokens[i], tokens[i + 1])
+                rank = self.ranks.get(pair)
+                if rank is not None and (best_rank is None or rank < best_rank):
+                    best_rank = rank
+                    best_pair = pair
+                i += 1
+
+            if best_pair is None:
+                break
+
+            # Merge all occurrences of best_pair
+            new_tokens: List[bytes] = []
+            i = 0
+            while i < len(tokens):
+                if i < len(tokens) - 1 and (tokens[i], tokens[i + 1]) == best_pair:
+                    new_tokens.append(tokens[i] + tokens[i + 1])
+                    i += 2
+                else:
+                    new_tokens.append(tokens[i])
+                    i += 1
+            tokens = new_tokens
+
+        for tok in tokens:
+            try:
+                yield self.bytes_to_id[tok]
+            except KeyError as e:
+                missing = e.args[0]
+                raise KeyError(
+                    f"Final token bytes {missing!r} not found in vocab. "
+                    "Ensure your vocab includes tokens for all BPE merges."
+                ) from None
 
 import numpy.typing as npt
 import torch
@@ -559,8 +718,7 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
-
+    return BPETokenizer(vocab, merges, special_tokens)
 
 def run_train_bpe(
     input_path: str | os.PathLike,
@@ -568,25 +726,142 @@ def run_train_bpe(
     special_tokens: list[str],
     **kwargs,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    """Given the path to an input corpus, run train a BPE tokenizer and
-    output its vocabulary and merges.
-
-    Args:
-        input_path (str | os.PathLike): Path to BPE tokenizer training data.
-        vocab_size (int): Total number of items in the tokenizer's vocabulary (including special tokens).
-        special_tokens (list[str]): A list of string special tokens to be added to the tokenizer vocabulary.
-            These strings will never be split into multiple tokens, and will always be
-            kept as a single token. If these special tokens occur in the `input_path`,
-            they are treated as any other string.
-
-    Returns:
-        tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-            vocab:
-                The trained tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
-                to bytes (token bytes)
-            merges:
-                BPE merges. Each list item is a tuple of bytes (<token1>, <token2>),
-                representing that <token1> was merged with <token2>.
-                Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    Train a byte-level BPE on UTF-8 bytes.
+
+    - Base vocab is all 256 single bytes.
+    - Training runs over the raw corpus bytes; special tokens are NOT excluded
+      from statistics (per spec: if they occur, they’re treated like any string).
+    - We split sequences at newline boundaries, but allow merges within newline runs
+      (so "\n\n" can be learned). This matches the encode logic you already have.
+    """
+    with open(input_path, "r", encoding="utf-8", errors="replace") as f:
+        text = f.read()
+
+    BYTE_NL = 10  # b"\n"
+
+    # 1. Split the input text into sequences based on newline boundaries
+    sequences: List[List[int]] = []
+    data = text.encode("utf-8")
+    n = len(data)
+    i = 0
+    while i < n:
+        try:
+            j = data.index(b"\n", i)
+        except ValueError:
+            j = n
+        
+        if j > i:
+            sequences.append(list(data[i:j]))
+
+        if j == n:
+            break
+
+        k = j
+        while k < n and data[k] == BYTE_NL:
+            k += 1
+        sequences.append([BYTE_NL] * (k - j))
+        i = k
+
+    if not sequences:
+        sequences = [[]]
+
+    # --- BPE training ---
+    next_token_id = 256
+    id_to_bytes: Dict[int, bytes] = {}
+    merges: List[Tuple[bytes, bytes]] = []
+
+    max_merges = max(0, vocab_size - 256 - len(special_tokens))
+    if max_merges == 0:
+        vocab = _assemble_vocab(id_to_bytes, [s.encode("utf-8") for s in (special_tokens or [])], vocab_size)
+        return vocab, merges
+
+    def id_to_bytes_fn(token_id: int) -> bytes:
+        return bytes([token_id]) if token_id < 256 else id_to_bytes[token_id]
+
+    # 2. Initial pair counting
+    pair_counts = Counter()
+    for seq in sequences:
+        if len(seq) >= 2:
+            pair_counts.update(zip(seq, seq[1:]))
+
+    # 3. Main BPE merge loop
+    for _ in range(max_merges):
+        if not pair_counts:
+            break
+
+        # Find the best pair to merge based on frequency and then by token ID for tie-breaking
+        best_pair = min(pair_counts, key=lambda p: (-pair_counts[p], p[0], p[1]))
+        best_a, best_b = best_pair
+
+        # Create the new token
+        new_id = next_token_id
+        next_token_id += 1
+        merged_bytes = id_to_bytes_fn(best_a) + id_to_bytes_fn(best_b)
+        id_to_bytes[new_id] = merged_bytes
+        merges.append((id_to_bytes_fn(best_a), id_to_bytes_fn(best_b)))
+
+        # **Performance Optimization**:
+        # Apply the merge and recount pairs for the next iteration in a single pass.
+        new_sequences = []
+        new_counts = Counter()
+        for seq in sequences:
+            if len(seq) < 2:
+                new_sequences.append(seq)
+                continue
+            
+            # Replace occurrences of the best pair with the new token ID
+            out = []
+            i = 0
+            while i < len(seq):
+                if i + 1 < len(seq) and seq[i] == best_a and seq[i+1] == best_b:
+                    out.append(new_id)
+                    i += 2
+                else:
+                    out.append(seq[i])
+                    i += 1
+            
+            # Recount pairs in the newly merged sequence
+            if len(out) >= 2:
+                new_counts.update(zip(out, out[1:]))
+            new_sequences.append(out)
+
+        sequences = new_sequences
+        pair_counts = new_counts
+
+    vocab = _assemble_vocab(id_to_bytes, [s.encode("utf-8") for s in (special_tokens or [])], vocab_size)
+    return vocab, merges
+
+
+def _assemble_vocab(
+    learned: Dict[int, bytes],
+    specials_bytes: List[bytes],
+    vocab_size: int,
+) -> Dict[int, bytes]:
+    # First 256: single bytes
+    vocab: Dict[int, bytes] = {i: bytes([i]) for i in range(256)}
+
+    # Learned tokens in creation order (ids are increasing)
+    for tid in sorted((k for k in learned.keys() if k >= 256)):
+        if len(vocab) >= vocab_size:
+            break
+        vocab[tid] = learned[tid]
+
+    # Append special tokens if there’s room; avoid duplicates
+    next_id = max(vocab.keys(), default=-1) + 1
+    existing_vals = set(vocab.values())
+    for sb in specials_bytes:
+        if len(vocab) >= vocab_size:
+            break
+        if sb in existing_vals:
+            continue
+        vocab[next_id] = sb
+        existing_vals.add(sb)
+        next_id += 1
+
+    # Trim if somehow over
+    if len(vocab) > vocab_size:
+        keep = sorted(vocab.keys())[:vocab_size]
+        vocab = {i: vocab[i] for i in keep}
+
+    return vocab
