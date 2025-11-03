@@ -6,7 +6,7 @@ from dataclasses import asdict, replace
 from datetime import datetime
 from typing import Any
 # --- your package imports ---
-from cs336_basics.training.config import default_cfg as base_cfg
+from cs336_basics.training.config import default_cuda_cfg as base_cfg
 from cs336_basics.training.trainer import Trainer
 from cs336_basics.training.config import Config
 

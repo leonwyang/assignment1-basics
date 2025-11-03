@@ -24,7 +24,7 @@ class Trainer:
             
         device = torch.device(cfg.trainer.device)
         self.model = cfg.model.make(device, dtype)
-        self.train_data, self.val_data = cfg.data.make()
+        self.train_data, self.val_data = cfg.data.make(device=device)
         self.optimizer = cfg.optim.make(self.model.parameters())
 
         # AMP / device

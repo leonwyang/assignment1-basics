@@ -27,8 +27,6 @@ class TrainerConfig:
     warmup_steps: int = 2_000                   # linear warmup to base LR
     lr_decay_style: Literal["cosine","linear","constant"] = "cosine"
     min_lr_factor: float = 0.10        
-    
-    
 
 @dataclass(frozen=False)
 class Config:
@@ -42,3 +40,8 @@ default_cfg = Config(data_config.MMDatasetConfig(),
                       model_config.TransformerConfig(),
                         optim_config.AdamWFactory(),
                           TrainerConfig())    
+
+default_cuda_cfg = Config(data_config.MMDatasetConfig(context_length=512,batch_size=64, val_batch_size=64),
+                      model_config.TransformerConfig(context_length=512),
+                        optim_config.AdamWFactory(),
+                          TrainerConfig(device="cuda", dtype="bfloat16"))   

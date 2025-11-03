@@ -11,19 +11,18 @@ class MMDatasetConfig:
     val_batch_size: int = 8
     context_length: int = 256
     seed: int = 42
-    device: str = "mps"
-
-    def make(self):
+    
+    def make(self, device):
         train = MemoryMappedDataset(
             path_or_ds=self.train_path,
             context_length=self.context_length,
-            device=self.device,
+            device=device,
             seed=self.seed,
         )
         val = MemoryMappedDataset(
             path_or_ds=self.validation_path,
             context_length=self.context_length,
-            device=self.device,
+            device=device,
             seed=self.seed,
         )
         return train, val
