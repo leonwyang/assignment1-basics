@@ -161,3 +161,16 @@ cython_debug/
 
 .ruff_cache/
 *.zip
+cs336_basics/Untitled.ipynb
+cs336_basics/tokenized_parallel/train.bin.meta.json
+.gitignore
+cs336_basics/tokenized_parallel/val.bin
+cs336_basics/tokenized_parallel/train.bin
+.gitignore
+data/owt_train.txt
+data/owt_valid.txt
+data/TinyStoriesV2-GPT4-train.txt
+data/TinyStoriesV2-GPT4-valid.txt
+Untitled2.ipynb
+cs336_basics/tokenized_parallel/val.bin.meta.json
+cs336_basics/bpe.py
